@@ -1,9 +1,11 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { CONTACTS as INITIAL_CONTACTS } from "../data/contacts";
 import { buildPrompt } from "../utils/promptBuilder";
 import { getMsgKey } from "../utils/msgKey";
 import { exportCSV } from "../utils/csvExport";
 import { generateTemplates } from "../utils/templateMessages";
+import { loadAll, saveMessage, saveStatus, saveSenderName, saveContacts } from "../lib/db";
+import { supabase } from "../lib/supabase";
 
 const FILTERS = [
   ["all", "All"],
@@ -23,6 +25,13 @@ function applyFilter(contacts, filter) {
   }
 }
 
+// Build a lookup: email → contact index, for mapping DB rows back to state
+function emailIndex(contacts) {
+  const map = {};
+  contacts.forEach((c, i) => { map[c.email] = i; });
+  return map;
+}
+
 export function useOutreach() {
   const [contacts, setContacts] = useState(INITIAL_CONTACTS);
   const [senderName, setSenderName] = useState("Alex");
@@ -35,7 +44,49 @@ export function useOutreach() {
   const [copied, setCopied] = useState(null);
   const [bulkGenerating, setBulkGenerating] = useState(false);
   const [bulkProgress, setBulkProgress] = useState(0);
+  const [dbLoading, setDbLoading] = useState(!!supabase);
   const bulkRef = useRef(false);
+  const saveTimer = useRef({});
+
+  // Load persisted state from Supabase on mount
+  useEffect(() => {
+    if (!supabase) return;
+    loadAll().then(data => {
+      if (!data) return;
+
+      // Restore contacts (custom uploads take precedence over hardcoded)
+      const allContacts = data.contacts?.length
+        ? data.contacts
+        : INITIAL_CONTACTS;
+      setContacts(allContacts);
+
+      const idx = emailIndex(allContacts);
+      const sender = data.settings?.sender_name ?? "Alex";
+      setSenderName(sender);
+
+      // Restore messages — seed templates first, then overlay saved content
+      const base = generateTemplates(allContacts, sender);
+      if (data.messages) {
+        data.messages.forEach(row => {
+          const i = idx[row.contact_email];
+          if (i !== undefined) {
+            base[getMsgKey(i, row.touch_type)] = row.content;
+          }
+        });
+      }
+      setMessages(base);
+
+      // Restore statuses
+      if (data.statuses) {
+        const st = {};
+        data.statuses.forEach(row => {
+          const i = idx[row.contact_email];
+          if (i !== undefined) st[i] = row.status;
+        });
+        setStatuses(st);
+      }
+    }).finally(() => setDbLoading(false));
+  }, []);
 
   const contact = contacts[selected] ?? contacts[0];
   const filteredContacts = applyFilter(contacts, filter);
@@ -45,15 +96,23 @@ export function useOutreach() {
   const generatedCount = Object.keys(messages).length;
 
   const getStatus = (idx) => statuses[idx] ?? "pending";
-  const setContactStatus = (idx, status) =>
+
+  const setContactStatus = (idx, status) => {
     setStatuses(s => ({ ...s, [idx]: status }));
+    saveStatus(contacts[idx]?.email, status);
+  };
 
   const updateSenderName = (name) => {
     setSenderName(name);
-    // Regenerate all templates with new sender name, but don't overwrite user edits —
-    // only update messages that still match the old template (length check is a heuristic;
-    // a simpler approach: keep a "is template" flag per message, but for now just regen all).
     setMessages(generateTemplates(contacts, name));
+    saveSenderName(name);
+  };
+
+  // Debounce message saves — wait 800ms after last keystroke
+  const persistMessage = (email, type, content) => {
+    const key = `${email}__${type}`;
+    clearTimeout(saveTimer.current[key]);
+    saveTimer.current[key] = setTimeout(() => saveMessage(email, type, content), 800);
   };
 
   const generate = useCallback(async (contactIdx, type) => {
@@ -76,6 +135,7 @@ export function useOutreach() {
       const data = await res.json();
       const text = data.content?.[0]?.text || "Error generating message";
       setMessages(m => ({ ...m, [key]: text }));
+      saveMessage(c.email, type, text);
     } catch {
       setMessages(m => ({ ...m, [key]: "API error — check connection" }));
     }
@@ -93,8 +153,7 @@ export function useOutreach() {
       if (!bulkRef.current) break;
       for (const type of types) {
         if (!bulkRef.current) break;
-        const key = getMsgKey(i, type);
-        if (!messages[key]) {
+        if (!messages[getMsgKey(i, type)]) {
           await generate(i, type);
           await new Promise(r => setTimeout(r, 400));
         }
@@ -120,23 +179,28 @@ export function useOutreach() {
   const deleteMessage = (key) =>
     setMessages(m => { const n = { ...m }; delete n[key]; return n; });
 
-  const editMessage = (key, value) =>
+  const editMessage = (key, value) => {
     setMessages(m => ({ ...m, [key]: value }));
+    // Parse contactIdx and type from key "{idx}-{type}"
+    const dash = key.lastIndexOf("-");
+    const idx = parseInt(key.slice(0, dash), 10);
+    const type = key.slice(dash + 1);
+    persistMessage(contacts[idx]?.email, type, value);
+  };
 
   const importContacts = (newContacts, mode) => {
+    const merged = mode === "replace" ? newContacts : [...contacts, ...newContacts];
+    setContacts(merged);
     if (mode === "replace") {
-      setContacts(newContacts);
-      setMessages(generateTemplates(newContacts, senderName));
+      const templates = generateTemplates(newContacts, senderName);
+      setMessages(templates);
       setStatuses({});
       setSelected(0);
     } else {
-      setContacts(prev => {
-        const merged = [...prev, ...newContacts];
-        setMessages(m => ({ ...m, ...generateTemplates(newContacts, senderName, prev.length) }));
-        return merged;
-      });
+      setMessages(m => ({ ...m, ...generateTemplates(newContacts, senderName, contacts.length) }));
     }
     setFilter("all");
+    saveContacts(merged);
   };
 
   return {
@@ -149,6 +213,7 @@ export function useOutreach() {
     filter, setFilter,
     copied,
     bulkGenerating, bulkProgress,
+    dbLoading,
     contact, filteredContacts,
     currentKey, currentMsg, isLoading,
     generatedCount,

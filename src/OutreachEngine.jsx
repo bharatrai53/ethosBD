@@ -38,6 +38,7 @@ export default function OutreachEngine() {
     copyText, deleteMessage, editMessage,
     importContacts,
     exportCSV,
+    dbLoading,
   } = useOutreach();
 
   const contactIdx = contacts.indexOf(contact);
@@ -45,6 +46,19 @@ export default function OutreachEngine() {
   function openInCompose(idx) {
     setSelected(idx);
     setView("compose");
+  }
+
+  if (dbLoading) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: T.bgMain, flexDirection: "column", gap: 16 }}>
+        <div style={{ display: "flex", gap: 6 }}>
+          {[0, 1, 2].map(i => (
+            <div key={i} className="loading-dot" style={{ width: 8, height: 8, borderRadius: "50%", background: T.accent, animationDelay: `${i * 0.2}s` }} />
+          ))}
+        </div>
+        <span style={{ fontFamily: T.mono, fontSize: 12, color: T.textMuted }}>Loading saved state…</span>
+      </div>
+    );
   }
 
   return (
